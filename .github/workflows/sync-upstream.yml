@@ -1,12 +1,17 @@
 # Auto-sync: keep this fork current with its upstream original.
 #
 # Runs daily (UTC 04:20, off-peak) and on manual trigger. Uses the built-in
-# GITHUB_TOKEN via the REST "merge-upstream" API — no secrets, no third-party
-# action. Behavior (verified against a live fork):
+# GITHUB_TOKEN — no secrets, no third-party action.
+#
+# Behavior:
 #   200 + merge_type "fast-forward" → synced, new head logged
 #   200 + merge_type "none"         → already current, clean skip
-#   409                             → diverged; logged for manual attention,
-#                                     never force-pushed (local work preserved)
+#   409 (diverged)                  → auto-merge anyway: a real git merge of
+#                                     upstream's branch into the fork with
+#                                     `-X ours` — all non-conflicting upstream
+#                                     changes are taken; on conflicting hunks
+#                                     the fork's local edits win, so local work
+#                                     (including this workflow file) survives.
 #   403                             → rate limit / forbidden; fails the job
 name: Sync with upstream
 "on":
@@ -23,6 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Sync default branch with upstream
+        id: sync
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -43,13 +49,16 @@ jobs:
               if [ "${merge_type}" = "none" ]; then
                 msg=$(jq -r '.message // "already current"' /tmp/sync-resp.json)
                 echo "::notice::already current — ${msg}"
+                echo "diverged=false" >> "$GITHUB_OUTPUT"
               else
                 echo "::notice::synced (${merge_type}) — new head ${new_sha}"
+                echo "diverged=false" >> "$GITHUB_OUTPUT"
               fi
               ;;
             409)
               msg=$(jq -r '.message // "diverged"' /tmp/sync-resp.json)
-              echo "::warning::diverged from upstream — manual attention needed: ${msg}"
+              echo "::notice::diverged — falling back to auto-merge: ${msg}"
+              echo "diverged=true" >> "$GITHUB_OUTPUT"
               ;;
             403)
               echo "::error::403 from merge-upstream (rate limit or forbidden). Response:"
@@ -62,3 +71,37 @@ jobs:
               exit 1
               ;;
           esac
+
+      - name: Check out diverged fork
+        if: steps.sync.outputs.diverged == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Auto-merge upstream into diverged fork
+        if: steps.sync.outputs.diverged == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          upstream=$(curl -s \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}" \
+            | jq -r '.parent.full_name // .source.full_name // empty')
+          if [ -z "${upstream}" ]; then
+            echo "::error::cannot resolve upstream repo for ${REPO}"
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://x-access-token:${GH_TOKEN}@github.com/${upstream}.git"
+          git fetch upstream "${BRANCH}"
+          # -X ours: take every non-conflicting upstream change; on conflicting
+          # hunks keep the fork's local edits. Never force-pushes.
+          git merge "upstream/${BRANCH}" -X ours --no-edit -m "Merge upstream ${upstream}:${BRANCH} (conflicts resolved in favor of local)"
+          git push origin "${BRANCH}"
+          echo "::notice::auto-merged upstream ${upstream}:${BRANCH} into ${BRANCH} (local edits preserved on conflicts)"
