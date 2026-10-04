@@ -1,12 +1,13 @@
 # Auto-sync: keep this fork current with its upstream original.
 #
 # Runs daily (UTC 04:20, off-peak) and on manual trigger. Uses the built-in
-# GITHUB_TOKEN via the REST "update branch" API — no secrets, no third-party
-# action. Behavior:
-#   - fast-forwardable → branch updated (merge_commit_sha returned)
-#   - already current  → 409 conflict, treated as clean skip
-#   - diverged         → 409 conflict, logged for manual attention (never
-#                        force-pushed; local work is never clobbered)
+# GITHUB_TOKEN via the REST "merge-upstream" API — no secrets, no third-party
+# action. Behavior (verified against a live fork):
+#   200 + merge_type "fast-forward" → synced, new head logged
+#   200 + merge_type "none"         → already current, clean skip
+#   409                             → diverged; logged for manual attention,
+#                                     never force-pushed (local work preserved)
+#   403                             → rate limit / forbidden; fails the job
 name: Sync with upstream
 "on":
   schedule:
@@ -37,12 +38,18 @@ jobs:
             -d "{\"branch\":\"${BRANCH}\"}")
           case "${http_code}" in
             200)
-              new_sha=$(jq -r '.merge_commit_sha // "unknown"' /tmp/sync-resp.json)
-              echo "::notice::synced — new head ${new_sha}"
+              merge_type=$(jq -r '.merge_type // "unknown"' /tmp/sync-resp.json)
+              new_sha=$(jq -r '.merge_commit_sha // "none"' /tmp/sync-resp.json)
+              if [ "${merge_type}" = "none" ]; then
+                msg=$(jq -r '.message // "already current"' /tmp/sync-resp.json)
+                echo "::notice::already current — ${msg}"
+              else
+                echo "::notice::synced (${merge_type}) — new head ${new_sha}"
+              fi
               ;;
             409)
-              msg=$(jq -r '.message // "conflict"' /tmp/sync-resp.json)
-              echo "::notice::no sync applied — ${msg}"
+              msg=$(jq -r '.message // "diverged"' /tmp/sync-resp.json)
+              echo "::warning::diverged from upstream — manual attention needed: ${msg}"
               ;;
             403)
               echo "::error::403 from merge-upstream (rate limit or forbidden). Response:"
