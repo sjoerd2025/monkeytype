@@ -1,107 +1,162 @@
-# Auto-sync: keep this fork current with its upstream original.
+name: Sync upstream
+
+# Keeps this fork up to date with its upstream repository.
 #
-# Runs daily (UTC 04:20, off-peak) and on manual trigger. Uses the built-in
-# GITHUB_TOKEN — no secrets, no third-party action.
+# - No new upstream commits -> no-op.
+# - Clean merge             -> pushed straight to the default branch.
+# - Conflicts               -> resolved by policy (KEEP_OURS / KEEP_THEIRS globs).
+# - Leftovers               -> pushed to a `sync-upstream/conflict-*` branch and
+#                              opened as a PR containing the conflict markers for
+#                              manual resolution.
 #
-# Behavior:
-#   200 + merge_type "fast-forward" → synced, new head logged
-#   200 + merge_type "none"         → already current, clean skip
-#   409 (diverged)                  → auto-merge anyway: a real git merge of
-#                                     upstream's branch into the fork with
-#                                     `-X ours` — all non-conflicting upstream
-#                                     changes are taken; on conflicting hunks
-#                                     the fork's local edits win, so local work
-#                                     (including this workflow file) survives.
-#   403                             → rate limit / forbidden; fails the job
-name: Sync with upstream
-"on":
+# Tune the policy per fork by editing the two env vars below. Scheduled runs
+# are staggered per repo; trigger manually with workflow_dispatch anytime.
+
+on:
   schedule:
-    - cron: "20 4 * * *"
-  workflow_dispatch: {}
+    - cron: "43 7 * * *" # daily; minutes/hours vary per repo to spread the load
+  workflow_dispatch:
+
 permissions:
   contents: write
+  pull-requests: write
+
 concurrency:
-  group: sync-with-upstream
+  group: sync-upstream
   cancel-in-progress: false
+
+env:
+  # Conflict policy: space-separated glob patterns matched against the path
+  # (bash [[ == ]], so ** spans directories). On a conflicted file:
+  #   KEEP_OURS   -> keep this fork's version
+  #   KEEP_THEIRS -> take the upstream version
+  #   neither     -> left conflicted and routed to a PR
+  # Files you actively customize should be added to KEEP_OURS in this repo's
+  # copy; docs/CI boilerplate you never touch is safe in KEEP_THEIRS.
+  KEEP_OURS: ""
+  KEEP_THEIRS: >-
+    *.md docs/** doc/** .github/** LICENSE* CODEOWNERS SECURITY* CONTRIBUTING*
+    NOTICE* .editorconfig .gitignore .gitattributes
+
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - name: Sync default branch with upstream
-        id: sync
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          BRANCH: ${{ github.event.repository.default_branch }}
-        run: |
-          set -euo pipefail
-          http_code=$(curl -s -o /tmp/sync-resp.json -w "%{http_code}" \
-            -X POST \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${REPO}/merge-upstream" \
-            -d "{\"branch\":\"${BRANCH}\"}")
-          case "${http_code}" in
-            200)
-              merge_type=$(jq -r '.merge_type // "unknown"' /tmp/sync-resp.json)
-              new_sha=$(jq -r '.merge_commit_sha // "none"' /tmp/sync-resp.json)
-              if [ "${merge_type}" = "none" ]; then
-                msg=$(jq -r '.message // "already current"' /tmp/sync-resp.json)
-                echo "::notice::already current — ${msg}"
-                echo "diverged=false" >> "$GITHUB_OUTPUT"
-              else
-                echo "::notice::synced (${merge_type}) — new head ${new_sha}"
-                echo "diverged=false" >> "$GITHUB_OUTPUT"
-              fi
-              ;;
-            409)
-              msg=$(jq -r '.message // "diverged"' /tmp/sync-resp.json)
-              echo "::notice::diverged — falling back to auto-merge: ${msg}"
-              echo "diverged=true" >> "$GITHUB_OUTPUT"
-              ;;
-            403)
-              echo "::error::403 from merge-upstream (rate limit or forbidden). Response:"
-              cat /tmp/sync-resp.json
-              exit 1
-              ;;
-            *)
-              echo "::error::unexpected HTTP ${http_code}. Response:"
-              cat /tmp/sync-resp.json
-              exit 1
-              ;;
-          esac
-
-      - name: Check out diverged fork
-        if: steps.sync.outputs.diverged == 'true'
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-          token: ${{ github.token }}
+          fetch-depth: 0 # full history is required to merge upstream
 
-      - name: Auto-merge upstream into diverged fork
-        if: steps.sync.outputs.diverged == 'true'
+      - name: Resolve upstream
+        id: upstream
         env:
           GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          parent=$(gh api "repos/${{ github.repository }}" --jq '.parent.full_name // empty')
+          if [ -z "$parent" ]; then
+            echo "Not a fork (or upstream was deleted) — nothing to sync." >> "$GITHUB_STEP_SUMMARY"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "parent=$parent" >> "$GITHUB_OUTPUT"
+          echo "ubranch=$(gh api "repos/$parent" --jq .default_branch)" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch upstream
+        if: steps.upstream.outputs.skip != 'true'
+        run: |
+          git remote add upstream "https://github.com/${{ steps.upstream.outputs.parent }}.git"
+          git fetch --no-tags upstream "${{ steps.upstream.outputs.ubranch }}"
+
+      - name: Merge upstream (policy-based conflict resolution)
+        if: steps.upstream.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          upstream=$(curl -s \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}" \
-            | jq -r '.parent.full_name // .source.full_name // empty')
-          if [ -z "${upstream}" ]; then
-            echo "::error::cannot resolve upstream repo for ${REPO}"
-            exit 1
-          fi
+          PARENT="${{ steps.upstream.outputs.parent }}"
+          UBRANCH="${{ steps.upstream.outputs.ubranch }}"
+          BRANCH="${{ github.ref_name }}"
+          MSG="chore: sync with upstream $PARENT ($UBRANCH)"
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git remote add upstream "https://x-access-token:${GH_TOKEN}@github.com/${upstream}.git"
-          git fetch upstream "${BRANCH}"
-          # -X ours: take every non-conflicting upstream change; on conflicting
-          # hunks keep the fork's local edits. Never force-pushes.
-          git merge "upstream/${BRANCH}" -X ours --no-edit -m "Merge upstream ${upstream}:${BRANCH} (conflicts resolved in favor of local)"
-          git push origin "${BRANCH}"
-          echo "::notice::auto-merged upstream ${upstream}:${BRANCH} into ${BRANCH} (local edits preserved on conflicts)"
+
+          # Push to the default branch; if the push is rejected (branch
+          # protection), fall back to a review PR.
+          push_or_pr() {
+            if ! git push origin "$BRANCH" 2>/dev/null; then
+              local cb="sync-upstream/pr-$(date +%Y%m%d-%H%M%S)"
+              git push origin "HEAD:refs/heads/$cb"
+              gh pr create --base "$BRANCH" --head "$cb" \
+                --title "$MSG (direct push rejected — opened as PR)" \
+                --body "Default branch rejected the direct push; review and merge manually."
+            fi
+          }
+
+          merge_log=$(git merge --no-ff "upstream/$UBRANCH" -m "$MSG" 2>&1) && clean=1 || clean=0
+          echo "$merge_log"
+
+          if echo "$merge_log" | grep -q "Already up to date"; then
+            echo "Upstream has nothing new — done." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "$clean" = 1 ]; then
+            echo "Clean merge — pushed to \`$BRANCH\`." >> "$GITHUB_STEP_SUMMARY"
+            push_or_pr
+            exit 0
+          fi
+
+          # The merge stopped on conflicts. If none are actually recorded,
+          # something else went wrong (e.g. untracked-file clobber) — abort.
+          if [ -z "$(git diff --name-only --diff-filter=U)" ]; then
+            git merge --abort 2>/dev/null || true
+            echo "Merge failed without conflicts (non-conflict error) — this run was aborted." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          # Classify and resolve conflicts per policy.
+          unresolved=()
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            resolved=""
+            for pat in $KEEP_OURS; do
+              # shellcheck disable=SC2053
+              [[ "$f" == $pat ]] && resolved="ours" && break
+            done
+            if [ -z "$resolved" ]; then
+              for pat in $KEEP_THEIRS; do
+                # shellcheck disable=SC2053
+                [[ "$f" == $pat ]] && resolved="theirs" && break
+              done
+            fi
+            case "$resolved" in
+              ours)   git checkout --ours -- "$f" && git add -- "$f"
+                      echo "KEPT OURS: $f" >> "$GITHUB_STEP_SUMMARY" ;;
+              theirs) git checkout --theirs -- "$f" && git add -- "$f"
+                      echo "TOOK UPSTREAM: $f" >> "$GITHUB_STEP_SUMMARY" ;;
+              *)      git add -- "$f" # stage as-is, conflict markers included
+                      unresolved+=("$f") ;;
+            esac
+          done < <(git diff --name-only --diff-filter=U)
+
+          git commit --no-edit -m "$MSG" >/dev/null
+
+          if [ "${#unresolved[@]}" -gt 0 ]; then
+            printf 'Unresolvable conflicts (opened a PR): %s\n' "${unresolved[*]}" >> "$GITHUB_STEP_SUMMARY"
+            cb="sync-upstream/conflict-$(date +%Y%m%d-%H%M%S)"
+            git push origin "HEAD:refs/heads/$cb"
+            {
+              echo "Automatic upstream sync from **$PARENT** hit conflicts the policy could not resolve:"
+              printf '\n- `%s`\n' "${unresolved[@]}"
+              echo
+              echo "The branch contains the conflict markers — resolve them, commit, and merge."
+            } > /tmp/pr-body.md
+            gh pr create --base "$BRANCH" --head "$cb" \
+              --title "Upstream sync: ${#unresolved[@]} conflicted file(s) need manual resolution" \
+              --body-file /tmp/pr-body.md
+            exit 0
+          fi
+
+          echo "Policy resolved all conflicts — merge pushed to \`$BRANCH\`." >> "$GITHUB_STEP_SUMMARY"
+          push_or_pr
